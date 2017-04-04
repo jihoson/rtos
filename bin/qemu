@@ -1,0 +1,11 @@
+#!/bin/bash
+
+BASE="`dirname \"$0\"`"
+
+KVM_PARAM=
+KVM=`grep "vmx\|svm" /proc/cpuinfo | wc -l`
+if [ $KVM != "0" ]; then
+	KVM_PARAM="-enable-kvm"
+fi
+
+exec sudo qemu-system-x86_64 $KVM_PARAM -m 256 -hda ${BASE}/system.img -M pc -smp 8 -d cpu_reset -no-reboot -no-shutdown -monitor stdio -net nic,model=virtio -net tap,script=${BASE}/qemu-ifup $@

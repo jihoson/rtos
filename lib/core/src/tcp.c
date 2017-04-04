@@ -3,7 +3,7 @@
 #include <string.h>
 #include <gmalloc.h>
 #include <timer.h>
-#include <net/ni.h>
+#include <net/nic.h>
 #include <net/packet.h>
 #include <net/ether.h>
 #include <net/arp.h>
@@ -86,7 +86,7 @@ typedef struct {
 	uint32_t last_ack;
 	uint16_t recv_mss;
 	uint8_t recv_wnd_scale;
-	NetworkInterface* ni;
+	NIC* nic;
 
 	bool delayed_ack_flag;
 	uint8_t syn_counter;
@@ -108,10 +108,10 @@ static bool delayed_ack_timer(void* context);
 static bool tcp_try_connect(void* context); 
 static bool time_wait_timer(void* context);
 
-static bool tcp_port_alloc0(NetworkInterface* ni, uint32_t addr, uint16_t port) {
-	IPv4Interface* interface = ni_ip_get(ni, addr);
+static bool tcp_port_alloc0(NIC* nic, uint32_t addr, uint16_t port) {
+	IPv4Interface* interface = nic_ip_get(nic, addr);
 	if(!interface->tcp_ports) {
-		interface->tcp_ports = set_create(64, set_uint64_hash, set_uint64_equals, ni->pool);
+		interface->tcp_ports = set_create(64, set_uint64_hash, set_uint64_equals, nic->pool);
 		if(!interface->tcp_ports)
 			return false;
 	}
@@ -122,10 +122,10 @@ static bool tcp_port_alloc0(NetworkInterface* ni, uint32_t addr, uint16_t port) 
 	return set_put(interface->tcp_ports, (void*)(uintptr_t)port);
 }
 
-static uint16_t tcp_port_alloc(NetworkInterface* ni, uint32_t addr) {
-	IPv4Interface* interface = ni_ip_get(ni, addr);
+static uint16_t tcp_port_alloc(NIC* nic, uint32_t addr) {
+	IPv4Interface* interface = nic_ip_get(nic, addr);
 	if(!interface->tcp_ports) {
-		interface->tcp_ports = set_create(64, set_uint64_hash, set_uint64_equals, ni->pool);
+		interface->tcp_ports = set_create(64, set_uint64_hash, set_uint64_equals, nic->pool);
 		if(!interface->tcp_ports)
 			return 0;
 	}
@@ -147,8 +147,8 @@ static uint16_t tcp_port_alloc(NetworkInterface* ni, uint32_t addr) {
 	return port;
 }
 
-static void tcp_port_free(NetworkInterface* ni, uint32_t addr, uint16_t port) {
-	IPv4Interface* interface = ni_ip_get(ni, addr);
+static void tcp_port_free(NIC* nic, uint32_t addr, uint16_t port) {
+	IPv4Interface* interface = nic_ip_get(nic, addr);
 	if(interface == NULL)
 		return;
 	
@@ -204,7 +204,7 @@ static TCB* tcb_get(uint64_t tcb_key) {
 	TCB* tcb = map_get(tcbs, (void*)(uintptr_t)tcb_key);
 
 	if(tcb == NULL) {
-		printf("tcb is null \n");
+		//printf("tcb is null \n");
 		return NULL;
 	}
 	return tcb;
@@ -286,7 +286,7 @@ static uint8_t wnd_scale_get(uint32_t recv_wnd_max) {
 	return scale;
 }
 
-static TCB* tcb_create(NetworkInterface* ni, uint32_t sip, uint32_t dip, uint16_t dport) {
+static TCB* tcb_create(NIC* nic, uint32_t sip, uint32_t dip, uint16_t dport) {
 	TCB* tcb = (TCB*)gmalloc(sizeof(TCB));
 	if(tcb == NULL) {
 		printf("tcb NULL\n");
@@ -308,7 +308,7 @@ static TCB* tcb_create(NetworkInterface* ni, uint32_t sip, uint32_t dip, uint16_
 	}
 
 	tcb->sip = sip; 
-	tcb->sport = tcp_port_alloc(ni, sip);
+	tcb->sport = tcp_port_alloc(nic, sip);
 
 	//printf("port : %u\n", tcb->sport);
 	if(tcb->sport == 0) {
@@ -342,7 +342,7 @@ static TCB* tcb_create(NetworkInterface* ni, uint32_t sip, uint32_t dip, uint16_
 	tcb->delayed_ack_timeout = 0;
 	tcb->syn_counter = 0;
 
-	tcb->ni = ni;
+	tcb->nic = nic;
 	// debug
 	debug_max = &(tcb->snd_wnd_max);
 	debug_cur = &(tcb->snd_wnd_cur);
@@ -351,14 +351,14 @@ static TCB* tcb_create(NetworkInterface* ni, uint32_t sip, uint32_t dip, uint16_
 }
 
 static bool tcb_destroy(TCB* tcb) {
-	tcp_port_free(tcb->ni, tcb->sip, tcb->sport);
+	tcp_port_free(tcb->nic, tcb->sip, tcb->sport);
 	
 	ListIterator iter;
 	list_iterator_init(&iter, tcb->unack_list);
 
 	while(list_iterator_has_next(&iter)) {
 		Segment* seg = list_iterator_next(&iter);
-		ni_free(seg->packet);
+		nic_free(seg->packet);
 		list_iterator_remove(&iter);
 		gfree(seg);
 	}
@@ -377,11 +377,11 @@ static bool tcb_destroy(TCB* tcb) {
 }
 
 // TODO: maybe need routing func that finds src_ip from ni.
-static uint32_t route(NetworkInterface* ni, uint32_t dst_addr, uint16_t des_port) {
+static uint32_t route(NIC* nic, uint32_t dst_addr, uint16_t des_port) {
 	IPv4Interface* interface = NULL;
 	uint32_t ip = 0;
 
-	Map* interfaces = ni_config_get(ni, NI_ADDR_IPv4);
+	Map* interfaces = nic_config_get(nic, NIC_ADDR_IPv4);
 	if(!interfaces)
 		return 0;
 
@@ -400,10 +400,10 @@ static uint32_t route(NetworkInterface* ni, uint32_t dst_addr, uint16_t des_port
 	return ip;
 }
 
-uint64_t tcp_connect(NetworkInterface* ni, uint32_t dst_addr, uint16_t dst_port) {
-	uint32_t src_addr = route(ni, dst_addr, dst_port);
+uint64_t tcp_connect(NIC* nic, uint32_t dst_addr, uint16_t dst_port) {
+	uint32_t src_addr = route(nic, dst_addr, dst_port);
 
-	TCB* tcb = tcb_create(ni, src_addr, dst_addr, dst_port);
+	TCB* tcb = tcb_create(nic, src_addr, dst_addr, dst_port);
 	if(tcb == NULL) {
 		printf("tcb NULL\n");
 		return 0;
@@ -418,7 +418,7 @@ uint64_t tcp_connect(NetworkInterface* ni, uint32_t dst_addr, uint16_t dst_port)
 		return 0;
 	}
 
-	uint64_t mac = arp_get_mac(ni, tcb->dip, tcb->sip);
+	uint64_t mac = arp_get_mac(nic, tcb->dip, tcb->sip);
 
 	if(mac == 0xffffffffffff) {
 		event_timer_add(tcp_try_connect, tcb, 0, 100000);
@@ -477,7 +477,7 @@ int32_t tcp_send(uint64_t socket, void* data, const uint16_t len) {
 			return 0;
 	}
 
-	if(!ni_output_available(tcb->ni))
+	if(!nic_output_available(tcb->nic))
 		return -3;
 	
 	// debug
@@ -512,7 +512,7 @@ bool tcp_process(Packet* packet) {
 
 	IP* ip = (IP*)ether->payload;
 
-	if(!ni_ip_get(packet->ni, endian32(ip->destination)))
+	if(!nic_ip_get(packet->nic, endian32(ip->destination)))
 		return false;
 	
 	if(ip->protocol != IP_PROTOCOL_TCP)
@@ -640,7 +640,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -676,7 +676,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -777,7 +777,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -804,7 +804,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -862,7 +862,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -889,7 +889,7 @@ bool tcp_process(Packet* packet) {
 							if(tcb->sent)
 								tcb->sent(tcb_key, seg->len, tcb->context);
 
-							ni_free(seg->packet);
+							nic_free(seg->packet);
 
 							if(seg->sequence + seg->len == tmp_ack) {
 								gfree(seg);
@@ -942,26 +942,26 @@ bool tcp_process(Packet* packet) {
 		default:
 			return false;
 	}
-	ni_free(packet);
+	nic_free(packet);
 	return true;
 }
 
 static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len) {
-	NetworkInterface* ni = tcb->ni;
+	NIC* nic = tcb->nic;
 
 	Packet* packet;
 
 	if(flags & SYN)
-		packet = ni_alloc(ni, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + 4 + 4/* option */ + len);
+		packet = nic_alloc(nic, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + 4 + 4/* option */ + len);
 	else
-		packet = ni_alloc(ni, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + len);
+		packet = nic_alloc(nic, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + len);
 
 	if(!packet)
 		return NULL;
 
 	Ether* ether = (Ether*)(packet->buffer + packet->start);
 	ether->dmac = endian48(tcb->dmac);
-	ether->smac = endian48(ni->mac);
+	ether->smac = endian48(nic->mac);
 	ether->type = endian16(ETHER_TYPE_IPv4);
 	
 	IP* ip = (IP*)ether->payload;
@@ -973,7 +973,7 @@ static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len)
 	ip_id = ip_get_id((flags & ACK) >> 4);
 	ip->id = endian16(ip_id);
 	ip->flags_offset = 0x40;
-	ip->ttl = endian8(IP_TTL);
+	ip->ttl = endian8(IPDEFTTL);
 	ip->protocol = endian8(IP_PROTOCOL_TCP);
 	ip->source = endian32(tcb->sip);
 	ip->destination = endian32(tcb->dip);
@@ -1020,12 +1020,12 @@ static bool packet_out(TCB* tcb, Packet* packet, uint16_t len) {
 	if(!packet)
 		return false;
 
-	NetworkInterface* ni = packet->ni;
+	NIC* nic = packet->nic;
 	
 	if(len == 0)
-		return ni_output(ni, packet);
+		return nic_output(nic, packet);
 
-	if(ni_output_dup(ni, packet)) {
+	if(nic_output_dup(nic, packet)) {
 		Segment* segment = gmalloc(sizeof(Segment));
 		if(!segment) {
 			printf("seg malloc fail\n");	// could be wrong
@@ -1041,13 +1041,13 @@ static bool packet_out(TCB* tcb, Packet* packet, uint16_t len) {
 			printf("list add fail\n");	//could be wrong
 			
 			gfree(segment);
-			ni_free(packet);
+			nic_free(packet);
 			return false;
 		}
 
 		return true;
 	} else {
-		ni_free(packet);
+		nic_free(packet);
 
 		return false;
 	}
@@ -1151,7 +1151,7 @@ static bool unacked_segment_timer(void* context) {
 
 				list_iterator_remove(&seg_iter);
 
-				printf("retrans!\n");
+				//printf("retrans!\n");
 			}
 		}
 	}
@@ -1189,7 +1189,7 @@ static bool delayed_ack_timer(void* context) {
 
 static bool tcp_try_connect(void* context) {
 	TCB* tcb = (TCB*)context;
-	uint64_t mac = arp_get_mac(tcb->ni, tcb->dip, tcb->sip);
+	uint64_t mac = arp_get_mac(tcb->nic, tcb->dip, tcb->sip);
 	
 	if(tcb->syn_counter++ == 3) {
 		tcb->state = TCP_CLOSED;
@@ -1201,7 +1201,7 @@ static bool tcp_try_connect(void* context) {
 	if(mac != 0xffffffffffff) {
 		tcb->dmac = mac;
 
-		if(!ni_output_available(tcb->ni))
+		if(!nic_output_available(tcb->nic))
 			return true;
 
 		Packet* packet = packet_create(tcb, SYN, NULL, 0);

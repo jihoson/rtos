@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <thread.h>
-#include <net/ni.h>
+#include <net/nic.h>
 #include <net/packet.h>
 #include <net/ether.h>
 #include <net/arp.h>
@@ -26,7 +26,7 @@ uint32_t err[6];
 uint64_t socket[SOCK_NUM];
 uint32_t conn;
 uint8_t buffer[BUF_SIZE +1];
-NetworkInterface* ni;
+NIC* nic;
 
 bool bps_checker(void* context) {
 //	printf("%u established, %u, %u, %u, %u, %u, %u, %u\n", total_rcv / BUF_SIZE, *debug_max, *debug_cur,  err[1], err[2], err[3], err[4], err[5]);
@@ -103,7 +103,7 @@ bool connecter(void* context) {
 	static int i;
 	int count;
 	for(count = 0; count < 500; count++) {
-		socket[i] = tcp_connect(ni, SERVER_IP, SERVER_PORT);
+		socket[i] = tcp_connect(nic, SERVER_IP, SERVER_PORT);
 		if(socket[i] == 0) {
 			printf("connect error!\n");
 			while(1);
@@ -131,9 +131,9 @@ void gdestroy() {
 }
 
 void ginit(int argc, char** argv) {
-	ni = ni_get(0);
-	if(ni != NULL) {
-		ni_ip_add(ni, address);
+	nic = nic_get(0);
+	if(nic != NULL) {
+		nic_ip_add(nic, address);
 	}
 
 	memset(buffer, 0xff, BUF_SIZE);
@@ -153,8 +153,8 @@ void init(int argc, char** argv) {
 
 }
 
-void process(NetworkInterface* ni){
-	Packet* packet = ni_input(ni);
+void process(NIC* nic){
+	Packet* packet = nic_input(nic);
 	if(!packet)
 		return;
 
@@ -176,7 +176,7 @@ void process(NetworkInterface* ni){
 	}
 	
 	if(packet)
-		ni_free(packet);
+		nic_free(packet);
 }
 
 int main(int argc, char** argv) {
@@ -195,13 +195,13 @@ int main(int argc, char** argv) {
 	int i = 0;
 	int total_count = 0;
 
-	NetworkInterface* ni = ni_get(0);
+	NIC* nic = nic_get(0);
 	while(1) {
-		if(ni_has_input(ni)) {
-			process(ni);
+		if(nic_has_input(nic)) {
+			process(nic);
 		}
 		if(i == 10000 && total_count < SOCK_NUM) {
-			uint64_t tmp_socket = tcp_connect(ni, SERVER_IP, SERVER_PORT);
+			uint64_t tmp_socket = tcp_connect(nic, SERVER_IP, SERVER_PORT);
 			if(tmp_socket == 0) {
 				printf("con error!\n");
 				while(1);

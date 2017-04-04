@@ -1,7 +1,7 @@
 #ifndef __NET_TCP_H__
 #define __NET_TCP_H__
 
-#include <net/ni.h>
+#include <net/nic.h>
 
 /**
  * @file
@@ -85,7 +85,7 @@ bool tcp_process(Packet* packet);
 /**
  * Connect to remote computer, Send SYN packet.
  *
- * @param ni NetworkInterface that IP is added
+ * @param nic NIC that IP is added
  * @param address remote computer's IP address
  * @param port remote computer's port
  * @return 0 if error occurred, else socket number used as a tcb_key internally
@@ -93,7 +93,7 @@ bool tcp_process(Packet* packet);
 // TODO: uint32_t return, 0 -> 0
 // ERROR; return 0, errno
 // TODO: socket's size!!
-uint64_t tcp_connect(NetworkInterface* ni, uint32_t address, uint16_t port);
+uint64_t tcp_connect(NIC* nic, uint32_t address, uint16_t port);
 
 /**
  * Send data.

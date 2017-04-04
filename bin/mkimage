@@ -1,0 +1,88 @@
+#!/bin/bash
+
+set -x
+
+BASE=$(dirname $0)
+
+MODULES="boot.mod crypto.mod extcmd.mod gettext.mod normal.mod terminal.mod serial.mod terminfo.mod"
+MODULES=`echo $MODULES | sed -r "s/([^ ]+)/$BASE\/grub-core\/\1/g"`
+
+# Ref: http://pete.akeo.ie/2014/05/compiling-and-installing-grub2-for.html
+function part_to_fs() {
+	case $1 in
+		"fat32") 
+			echo "vfat"
+		;;
+		*)
+			echo $1
+		;;
+	esac
+}
+
+function check_number() {
+	if [ $2 -eq $2 ]; then
+		:
+	else
+		echo "$1 must be a number: $2"
+		exit -1
+	fi
+}
+
+if [ $# -lt 8 ]; then
+	echo "mkimage [image name] [boot part size] [root part size] [boot part type] [root part type] [user part type] [boot files]"
+	exit -1
+fi
+
+IMAGE=$1		# system.img
+BOOT=$2		    # 4
+ROOT=$3			# 12
+
+# Rest of space will be user parition
+BOOT_TYPE=$4	# fat32
+ROOT_TYPE=$5	# fat32
+USER_TYPE=$6	# ext2
+
+BOOT_FS=$(part_to_fs $BOOT_TYPE)
+ROOT_FS=$(part_to_fs $ROOT_TYPE)
+USER_FS=$(part_to_fs $USER_TYPE)
+
+FILES=${@:7}
+
+check_number "boot size" $BOOT
+check_number "root size" $ROOT
+
+# Make disk image
+$BASE/grub-mkimage -v -O i386-pc -d $BASE/grub-core -p\(hd0,msdos1\)/boot/grub biosdisk part_msdos fat exfat bfs multiboot2 -o $BASE/grub-core/core.img
+
+sudo parted -s $IMAGE --			\
+	mklabel msdos			\
+	mkpart primary $BOOT_TYPE 1MiB $(($BOOT + 1))MiB	\
+	mkpart primary $ROOT_TYPE $(($BOOT + 1))MiB $(($BOOT + 1 + $ROOT))MiB	\
+	mkpart primary $USER_TYPE  $(($BOOT + 1 + $ROOT))MiB -1s	\
+	set 1 boot on
+
+sudo kpartx -a -s -v $IMAGE
+KPARTX=`sudo kpartx -l $IMAGE | head -n3`
+
+HDD=`echo $KPARTX | awk 'BEGIN { RS=""; FS=" "} {print $5 }'`
+HDD1=`echo $KPARTX | awk 'BEGIN { RS=""; FS=" "} {print $1 }'`
+HDD2=`echo $KPARTX | awk 'BEGIN { RS=""; FS=" "} {print $7 }'`
+HDD3=`echo $KPARTX | awk 'BEGIN { RS=""; FS=" "} {print $13 }'`
+
+sudo mkfs.$BOOT_FS -F32 /dev/mapper/$HDD1
+sudo mkfs.$ROOT_FS -F32 /dev/mapper/$HDD2
+sudo mkfs.$USER_FS /dev/mapper/$HDD3
+
+sudo $BASE/grub-bios-setup -d $BASE/grub-core -b boot.img -c core.img $HDD
+
+mkdir -p mnt
+sudo mount /dev/mapper/$HDD1 mnt
+sudo mkdir -p mnt/boot/grub/i386-pc
+sudo cp $FILES mnt/boot/
+sudo cp $BASE/grub.cfg mnt/boot/grub
+sudo cp $MODULES mnt/boot/grub/i386-pc/
+
+sudo umount mnt
+rmdir mnt
+
+sudo kpartx -d $IMAGE

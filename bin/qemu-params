@@ -1,0 +1,6 @@
+#!/bin/bash
+
+KVM=`grep "vmx\|svm" /proc/cpuinfo | wc -l`
+if [ $KVM != "0" ]; then
+   echo "-enable-kvm"
+fi
