@@ -10,8 +10,8 @@
 
 #define TCP_LEN			20		///< TCPv4 header length
 
-int32_t* debug_cur;
-int32_t* debug_max;
+uint32_t* debug_cur;
+uint32_t* debug_max;
 //uint32_t debug_same;
 /**
  * TCPv4 header

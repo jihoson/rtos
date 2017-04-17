@@ -83,8 +83,8 @@ typedef struct {
 
 	List* unack_list;	// sent segment but no ack.
 	Map* rcv_buffer;
-	int32_t snd_wnd_max;
-	int32_t snd_wnd_cur;
+	uint32_t snd_wnd_max;
+	uint32_t snd_wnd_cur;
 	uint16_t snd_mss;
 	uint8_t snd_wnd_scale;
 
@@ -97,8 +97,8 @@ typedef struct {
 	bool delayed_ack_flag;
 	uint8_t syn_counter;
 	uint64_t delayed_ack_timeout;
-	int32_t cwnd;
-	int32_t ssthresh;
+	uint32_t cwnd;
+	uint32_t ssthresh;
 } TCB;
 
 typedef bool (*tcp_proc_func)(TCB* tcb, Packet* packet);
@@ -951,79 +951,41 @@ static bool process_established(TCB* tcb, Packet* in_packet) {
 		tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;	//TODO: need some condition for sequence num checking
 
 		uint32_t acked_size = tmp_ack - tcb->last_ack;
+		
+		//need fast retransmssion and handling when acked_size is zero.
+		//don't include range when tmp_ack and last_ack are same
+		if(tcb->sequence - tmp_ack < tcb->snd_wnd_cur) {
+			ListIterator unack_list_iter;
+			list_iterator_init(&unack_list_iter, tcb->unack_list);
 
-		if(tcb->last_ack <= tcb->sequence) {
-			if(tcb->last_ack < tmp_ack && tmp_ack <= tcb->sequence) {
-				//tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
-
-				if(tcb->cwnd < tcb->ssthresh) {	//slow start
-					if(acked_size >= tcb->snd_mss)
-						tcb->cwnd += tcb->snd_mss; 
-					else
-						tcb->cwnd += acked_size; 
-				} else {	//congestion avoidance
-					tcb->cwnd += (tcb->snd_mss * tcb->snd_mss) / tcb->cwnd;
-				}
-
-				tcb->last_ack = tmp_ack;
-
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
-
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
-
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
-
-					nic_free(seg->packet);
-
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
-				}
+			if(tcb->cwnd < tcb->ssthresh) {
+				if(acked_size >= tcb->snd_mss)
+					tcb->cwnd += tcb->snd_mss;
+				else
+					tcb->cwnd += acked_size;
+			} else {
+				tcb->cwnd += (tcb->snd_mss * tcb->snd_mss) / tcb->cwnd;
 			}
-		} else {
-			if(tcb->last_ack < tmp_ack || tmp_ack <= tcb->sequence) {
-				//tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
 
-				if(tcb->cwnd < tcb->ssthresh) {	//slow start
-					if(acked_size >= tcb->snd_mss)
-						tcb->cwnd += tcb->snd_mss; 
-					else
-						tcb->cwnd += acked_size; 
-				} else {	//congestion avoidance
-					tcb->cwnd += (tcb->snd_mss * tcb->snd_mss) / tcb->cwnd;
-				}
+			tcb->last_ack = tmp_ack;
 
-				tcb->last_ack = tmp_ack;
+			while(list_iterator_has_next(&unack_list_iter)) {
+				Segment* seg = list_iterator_next(&unack_list_iter);
 
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
+				list_iterator_remove(&unack_list_iter);
+				tcb->snd_wnd_cur -= seg->len;
 
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
+				uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
+				if(tcb->sent) 
+					tcb->sent(tcb_key, seg->len, tcb->context);
 
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
-
-					nic_free(seg->packet);
-
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
+				nic_free(seg->packet);
+				
+				if(seg->sequence + seg->len == tmp_ack) {
+					gfree(seg);
+					break;
+				} else {
+					gfree(seg);
 				}
 			}
 		}
@@ -1112,63 +1074,33 @@ static bool process_fin_wait_1(TCB* tcb, Packet* in_packet) {
 		uint32_t tmp_ack = endian32(tcp->acknowledgement);
 
 		tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;	//TODO: need some condition
+		
+		if(tcb->sequence - tmp_ack < tcb->snd_wnd_cur) {
+			ListIterator iter;
+			list_iterator_init(&iter, tcb->unack_list);
 
-		if(tcb->last_ack <= tcb->sequence) {
-			if(tcb->last_ack < tmp_ack && tmp_ack <= tcb->sequence) {
-				//tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
+			tcb->last_ack = tmp_ack;
 
-				tcb->last_ack = tmp_ack;
+			while(list_iterator_has_next(&iter)) {
+				Segment* seg = list_iterator_next(&iter);
 
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
+				list_iterator_remove(&iter);
+				tcb->snd_wnd_cur -= seg->len;
 
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
+				uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
+				if(tcb->sent)
+					tcb->sent(tcb_key, seg->len, tcb->context);
 
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
+				nic_free(seg->packet);
 
-					nic_free(seg->packet);
-
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
+				if(seg->sequence + seg->len == tmp_ack) {
+					gfree(seg);
+					break;
+				} else {
+					gfree(seg);
 				}
 			}
-		} else {
-			if(tcb->last_ack < tmp_ack || tmp_ack <= tcb->sequence) {
-				//tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
 
-				tcb->last_ack = tmp_ack;
-
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
-
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
-
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
-
-					nic_free(seg->packet);
-
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
-				}
-			}
 		}
 
 		uint16_t len = endian16(ip->length) - ip->ihl * 4 - tcp->offset * 4;
@@ -1206,60 +1138,29 @@ static bool process_fin_wait_2(TCB* tcb, Packet* in_packet) {
 
 		tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;	//TODO: need some condition
 
-		if(tcb->last_ack <= tcb->sequence) {
-			if(tcb->last_ack < tmp_ack && tmp_ack <= tcb->sequence) {
-				//tcb->snd_wrd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
+		if(tcb->sequence - tmp_ack < tcb->snd_wnd_cur) {
+			ListIterator iter;
+			list_iterator_init(&iter, tcb->unack_list);
 
-				tcb->last_ack = tmp_ack;
+			tcb->last_ack = tmp_ack;
 
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
+			while(list_iterator_has_next(&iter)) {
+				Segment* seg = list_iterator_next(&iter);
 
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
-	
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
+				list_iterator_remove(&iter);
+				tcb->snd_wnd_cur -= seg->len;
 
-					nic_free(seg->packet);
+				uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
+				if(tcb->sent)
+					tcb->sent(tcb_key, seg->len, tcb->context);
 
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
-				}
-			}
-		} else {
-			if(tcb->last_ack < tmp_ack || tmp_ack <= tcb->sequence) {
-				//tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
-				ListIterator iter;
-				list_iterator_init(&iter, tcb->unack_list);
+				nic_free(seg->packet);
 
-				tcb->last_ack = tmp_ack;
-
-				while(list_iterator_has_next(&iter)) {
-					Segment* seg = list_iterator_next(&iter);
-
-					list_iterator_remove(&iter);
-					tcb->snd_wnd_cur -= seg->len;
-
-					uint64_t tcb_key = tcb_key_create(ip->destination, tcp->destination);
-					if(tcb->sent)
-						tcb->sent(tcb_key, seg->len, tcb->context);
-
-					nic_free(seg->packet);
-
-					if(seg->sequence + seg->len == tmp_ack) {
-						gfree(seg);
-						break;
-					} else {
-						gfree(seg);
-					}
+				if(seg->sequence + seg->len == tmp_ack) {
+					gfree(seg);
+					break;
+				} else {
+					gfree(seg);
 				}
 			}
 		}
