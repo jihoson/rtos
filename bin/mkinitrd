@@ -1,0 +1,45 @@
+#!/bin/bash
+
+if [ $# -lt 3 ]; then
+	echo "mkinitrd [image name] [image size in MB] [files...]"
+	exit -1
+fi
+
+BASE=$(dirname $0)
+
+INITRD=$1		    # initrd.img
+INITRD_SIZE=$2		# 4
+FILES=${@:3}		# drivers/*.ko firmware/*
+
+TOTAL_FILE_SIZE=$(du -c $FILES | grep total | cut -f1)
+
+if [ ! $TOTAL_FILE_SIZE -lt $(($INITRD_SIZE * 1000)) ]; then
+    echo "Total file size must be smaller than Image size"
+    exit -1
+else
+    echo "Total file size $TOTAL_FILE_SIZE"
+fi
+
+if [ $INITRD_SIZE -eq $INITRD_SIZE ]; then
+	:
+else
+	echo "Image size must be a number: $INITRD_SIZE"
+	exit -1
+fi
+
+# Make initial root disk image
+dd if=/dev/zero of=$INITRD bs=512 count=$(($INITRD_SIZE * 2048))
+
+sudo losetup -f $INITRD
+DEVICE=`losetup -j $INITRD | awk '{ split($1, a, ":"); print a[1] }'`
+sudo $BASE/mkfs.bfs $DEVICE
+mkdir -p mnt
+sudo mount $DEVICE mnt
+echo $FILES
+sudo cp $FILES mnt
+sync
+sudo umount mnt
+rmdir mnt
+
+sudo losetup -d $DEVICE
+
