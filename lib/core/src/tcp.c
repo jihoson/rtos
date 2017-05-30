@@ -30,8 +30,11 @@
 #define ACK_TIMEOUT	2000	// 2 sec
 #define MSL		10000000	// 10 sec 
 #define RECV_WND_SCALE	128	
-#define SMSS	1460	//Sender Maximum Segment Size
+#define RMSS	1460
 
+#define NAGLE_ON 0x01
+
+//#define printf(...)
 extern void* __gmalloc_pool;
 
 typedef enum {
@@ -99,6 +102,10 @@ typedef struct {
 	uint64_t delayed_ack_timeout;
 	uint32_t cwnd;
 	uint32_t ssthresh;
+
+	Packet* packet;
+	uint16_t packet_data_len;
+	uint8_t sock_opt;
 } TCB;
 
 typedef bool (*tcp_proc_func)(TCB* tcb, Packet* packet);
@@ -135,6 +142,10 @@ static List* time_wait_list;
 static List* conn_try_list;
 
 static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len);
+static Packet* tcp_packet_create(TCB* tcb);
+static bool tcp_packet_out(TCB* tcb, Packet* packet, uint16_t len);
+static bool tcp_packet_prepare(TCB* tcb, Packet* packet, uint8_t flags);
+static int32_t tcp_data_add(Packet* packet, const void* data, int len);
 static bool packet_out(TCB* tcb, Packet* packet, uint16_t len); 
 static bool unacked_segment_timer(void* context); 
 static bool delayed_ack_timer(void* context); 
@@ -224,6 +235,7 @@ static void ip_init_id() {
 	ip_id = 0x8000;
 }
 
+//TODO:maybe we don't need condition just ++
 static uint32_t ip_get_id(int ack) {
 	if(ack == 1) {
 		return ip_id;
@@ -241,6 +253,28 @@ static TCB* tcb_get(uint64_t tcb_key) {
 		return NULL;
 	}
 	return tcb;
+}
+
+//TODO:need to implement all other options.
+int setsockopt(uint64_t socket, int level, int optname, void* optval, int optlen) {
+	TCB* tcb = tcb_get(socket);
+	if(!tcb)
+		return -1;
+	
+	switch(level) {
+		case SOL_SOCKET:
+			break;
+		case IPPROTO_TCP:
+			if(optname == TCP_NODELAY) {
+				tcb->sock_opt = *(uint8_t*)optval;	//TODO:maybe change opt data type, struct or something else
+			}
+			break;
+		default:
+			return -1;
+			break;
+	}
+
+	return 0;
 }
 
 // hash functions using Jenkins's one-at-a-time hash
@@ -376,6 +410,9 @@ static TCB* tcb_create(NIC* nic, uint32_t sip, uint32_t dip, uint16_t dport) {
 	tcb->syn_counter = 0;
 
 	tcb->nic = nic;
+	tcb->packet = NULL;
+	tcb->packet_data_len = 0;
+	tcb->sock_opt = 0;
 	// debug
 	debug_max = &(tcb->snd_wnd_max);
 	debug_cur = &(tcb->snd_wnd_cur);
@@ -485,6 +522,141 @@ bool tcp_close(uint64_t socket) {
 	return true;
 }
 
+int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
+	uint32_t avail_wnd_len = 0;
+	uint16_t sent_len = 0;
+
+	if(len == 0)
+		return 0;
+
+	TCB* tcb = tcb_get(socket);
+	if(!tcb)
+		return -1;
+
+	if(tcb->state != TCP_ESTABLISHED)
+		return -2;
+
+	if(tcb->snd_wnd_max < tcb->cwnd)
+		avail_wnd_len = tcb->snd_wnd_max - tcb->snd_wnd_cur;
+	else
+		avail_wnd_len = tcb->cwnd - tcb->snd_wnd_cur;
+
+	if(avail_wnd_len == 0)
+		return 0;
+
+	//fill buffered packet first
+	uint16_t len_to_send = tcb->snd_mss - tcb->packet_data_len > len ? len : tcb->snd_mss - tcb->packet_data_len;
+
+	if(avail_wnd_len < tcb->snd_mss)
+		return sent_len;
+
+	if(!nic_output_available(tcb->nic))
+		return sent_len;
+
+	if(!tcb->packet) {
+		tcb->packet = tcp_packet_create(tcb);
+		if(!tcb->packet)
+			return sent_len;	//0
+		tcb->packet_data_len = 0;
+	}
+
+	tcb->packet_data_len += tcp_data_add(tcb->packet, data, len_to_send);
+	sent_len += len_to_send;
+	len -= len_to_send;
+	data = (uint8_t*)data + len_to_send;
+	
+	//buffering packet if nagle on
+	if(tcb->packet_data_len < tcb->snd_mss) {
+		if(!(tcb->sock_opt & TCP_NODELAY) && tcb->snd_wnd_cur > 0)
+			return sent_len;
+	}
+
+	if(!tcp_packet_prepare(tcb, tcb->packet, ACK))
+		return sent_len;
+
+	if(!tcp_packet_out(tcb, tcb->packet, tcb->packet_data_len))
+		return sent_len;
+
+	avail_wnd_len -= tcb->packet_data_len;
+	tcb->snd_wnd_cur += tcb->packet_data_len;
+	tcb->sequence += tcb->packet_data_len;
+	tcb->packet_data_len = 0;
+	tcb->packet = NULL;
+	tcb->delayed_ack_flag = false;
+
+	if(len == 0)
+		return sent_len;
+	
+	//segmentation about big size data(bigger than snd_mss)
+	while(len >= tcb->snd_mss) {
+		if(avail_wnd_len < tcb->snd_mss)
+			return sent_len;
+
+		if(!nic_output_available(tcb->nic))
+			return sent_len;
+
+		tcb->packet = tcp_packet_create(tcb);
+		if(!tcb->packet)
+			return sent_len;
+
+		tcb->packet_data_len = tcp_data_add(tcb->packet, data, tcb->snd_mss);
+		sent_len += tcb->packet_data_len;
+		len -= tcb->packet_data_len;
+		data = (uint8_t*)data + tcb->packet_data_len;
+
+		if(!tcp_packet_prepare(tcb, tcb->packet, ACK))
+			return sent_len;
+
+		if(!tcp_packet_out(tcb, tcb->packet, tcb->packet_data_len))
+			return sent_len;
+
+		avail_wnd_len -= tcb->packet_data_len;
+		tcb->snd_wnd_cur += tcb->packet_data_len;
+		tcb->sequence += tcb->packet_data_len;
+		tcb->packet_data_len = 0;
+		tcb->packet = NULL;
+		tcb->delayed_ack_flag = false;
+	}
+
+	if(len == 0)
+		return sent_len;
+
+	//remain data processing
+	if(avail_wnd_len < len)
+		return sent_len;
+
+	if(!nic_output_available(tcb->nic))
+		return sent_len;
+
+	tcb->packet = tcp_packet_create(tcb);
+	if(!tcb->packet)
+		return sent_len;
+
+	tcb->packet_data_len = tcp_data_add(tcb->packet, data, len);
+	sent_len += tcb->packet_data_len;
+	len -= tcb->packet_data_len;
+	data = (uint8_t*)data + tcb->packet_data_len;
+
+	if(!(tcb->sock_opt & TCP_NODELAY))	//buffering packet if nagle on
+		return sent_len;
+
+	if(!tcp_packet_prepare(tcb, tcb->packet, ACK))
+		return sent_len;
+
+	if(!tcp_packet_out(tcb, tcb->packet, tcb->packet_data_len))
+		return sent_len;
+
+	avail_wnd_len -= tcb->packet_data_len;
+	tcb->snd_wnd_cur += tcb->packet_data_len;
+	tcb->sequence += tcb->packet_data_len;
+	tcb->packet_data_len = 0;
+	tcb->packet = NULL;
+	tcb->delayed_ack_flag = false;
+
+	return sent_len;
+}
+
+/*
 int32_t tcp_send(uint64_t socket, void* data, const uint16_t len) {
 	if(len == 0)
 		return 0;
@@ -513,17 +685,6 @@ int32_t tcp_send(uint64_t socket, void* data, const uint16_t len) {
 	if(!nic_output_available(tcb->nic))
 		return -3;
 	
-	// debug
-	/*
-	if(tcb->snd_wnd_max < tcb->cwnd) {
-		memcpy(data, &(tcb->snd_wnd_max), 4);
-		memcpy((int32_t*)data + 1, &(tcb->snd_wnd_cur), 4);
-	} else {
-		memcpy(data, &(tcb->cwnd), 4);
-		memcpy((int32_t*)data + 1, &(tcb->cwnd), 4);
-	}
-	*/
-
 	Packet* packet = packet_create(tcb, ACK | PSH, data, len);
 	if(!packet)
 		return -4;
@@ -537,6 +698,7 @@ int32_t tcp_send(uint64_t socket, void* data, const uint16_t len) {
 
 	return len;	
 }
+*/
 
 bool tcp_process(Packet* packet) {
 	Ether* ether = (Ether*)(packet->buffer + packet->start);
@@ -570,6 +732,140 @@ bool tcp_process(Packet* packet) {
 	return true;
 }
 
+//create packet with no data, only fills immutable header
+static Packet* tcp_packet_create(TCB* tcb) {
+	NIC* nic = tcb->nic;
+
+	Packet* packet = nic_alloc(nic, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + RMSS);
+
+	if(!packet)
+		return NULL;
+	
+	packet->end -= RMSS;
+
+	Ether* ether = (Ether*)(packet->buffer + packet->start);
+	ether->dmac = endian48(tcb->dmac);
+	ether->smac = endian48(nic->mac);
+	ether->type = endian16(ETHER_TYPE_IPv4);
+
+	IP* ip = (IP*)ether->payload;
+	ip->ihl = endian8(5);
+	ip->version = endian8(4);
+	ip->ecn = endian8(0); 
+	ip->dscp = endian8(0);
+	ip->length = endian16(sizeof(IP) + sizeof(TCP));
+
+	//ip_id = ip_get_id((flags & ACK) >> 4);
+	ip->id = endian16(ip_id);	//TODO: need increment ip_id
+	ip->flags_offset = 0x40;
+	ip->ttl = endian8(IPDEFTTL);
+	ip->protocol = endian8(IP_PROTOCOL_TCP);
+	ip->source = endian32(tcb->sip);
+	ip->destination = endian32(tcb->dip);
+	
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
+	tcp->source = endian16(tcb->sport);
+	tcp->destination = endian16(tcb->dport);
+	tcp->ns = endian8(0);
+	tcp->reserved = endian8(0);
+	tcp->offset = endian8(5);
+
+	return packet;
+}
+
+//TODO: maybe need available packet len checking
+static int32_t tcp_data_add(Packet* packet, const void* data, int len) {
+	if(!packet)
+		return -1;
+
+	Ether* ether = (Ether*)(packet->buffer + packet->start);
+	IP* ip = (IP*)ether->payload;
+
+	memcpy((uint8_t*)ip + endian16(ip->length), data, len);
+
+	ip->length = endian16(endian16(ip->length) + len);
+
+	return len;
+}
+
+static bool tcp_packet_prepare(TCB* tcb, Packet* packet, uint8_t flags) {
+	if(!packet)
+		return false;
+	
+	Ether* ether = (Ether*)(packet->buffer + packet->start);
+	IP* ip = (IP*)ether->payload;
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
+
+	tcp->sequence = endian32(tcb->sequence);
+	tcp->acknowledgement = endian32(tcb->acknowledgement);
+	tcp->fin = flags & FIN; 
+	tcp->syn = (flags & SYN) >> 1;
+	tcp->rst = (flags & SYN) >> 2;
+	tcp->psh = (flags & PSH) >> 3;
+	tcp->ack = (flags & ACK) >> 4;
+	tcp->urg = (flags & URG) >> 5;
+	tcp->ece = (flags & ECE) >> 6;
+	tcp->cwr = (flags & CWR) >> 7;
+	tcp->window = endian16(tcb->recv_wnd_max);
+	tcp->urgent = endian16(0);
+
+	uint16_t data_len = endian16(ip->length) - ip->ihl * 4 - tcp->offset * 4;
+	//FIXME:tcp_offset was zero... watch out!
+
+	if(tcp->syn) {	//TODO: need to intergrate packet_create and this
+		tcp->offset = endian8(7);
+		uint32_t mss_option = endian32(0x02040000 + RMSS);
+		uint32_t win_option = endian32(0x01030300 + tcb->recv_wnd_scale);
+
+		memcpy(tcp->payload, &mss_option, 4);
+		memcpy((uint8_t*)(tcp->payload) + 4, &win_option, 4);
+
+		tcp_pack(packet, data_len + 4 + 4);
+	} else {
+		tcp->offset = endian8(5);
+		//memcpy((uint8_t*)tcp + tcp->offset * 4, data, len);
+		tcp_pack(packet, data_len);
+	}
+
+	//packet_dump(packet);
+	return true;
+}
+
+static bool tcp_packet_out(TCB* tcb, Packet* packet, uint16_t len) {
+	if(!packet)
+		return false;
+	
+	NIC* nic = packet->nic;
+
+	if(len == 0)
+		return nic_output(nic, packet);
+
+	if(nic_output_dup(nic, packet)) {
+		Segment* segment = gmalloc(sizeof(Segment));
+		if(!segment) {
+			printf("seg malloc fail\n");	//FIXME: could be wrong
+			return false;
+		}
+
+		segment->timeout = timer_ms() + ACK_TIMEOUT;
+		segment->len = len;
+		segment->sequence = tcb->sequence;
+		segment->packet = packet;
+
+		if(!list_add(tcb->unack_list, segment)) {
+			printf("list add fail\n");	//FIXME: could be wrong
+			gfree(segment);
+			nic_free(packet);
+			return false;
+		}
+
+		return true;
+	} else {
+		nic_free(packet);
+
+		return false;
+	}
+}
 static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len) {
 	NIC* nic = tcb->nic;
 
@@ -602,7 +898,7 @@ static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len)
 	ip->source = endian32(tcb->sip);
 	ip->destination = endian32(tcb->dip);
 	
-	TCP* tcp = (TCP*)ip->body;
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
 	tcp->source = endian16(tcb->sport);
 	tcp->destination = endian16(tcb->dport);
 	tcp->sequence = endian32(tcb->sequence);
@@ -623,7 +919,7 @@ static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len)
 	if(tcp->syn) {
 		tcp->offset = endian8(7);
 		//uint32_t mss_option = endian32(0x020405b4);
-		uint32_t mss_option = endian32(0x02040578);
+		uint32_t mss_option = endian32(0x02040000 + RMSS);
 		uint32_t win_option = endian32(0x01030300 + tcb->recv_wnd_scale);
 
 		memcpy(tcp->payload, &mss_option, 4);
@@ -764,12 +1060,12 @@ static bool unacked_segment_timer(void* context) {
 
 			// retransmission
 			if(packet_out(tcb, segment->packet, segment->len)) {
-				if(tcb->snd_wnd_cur / 2 > 2 * SMSS)
+				if(tcb->snd_wnd_cur / 2 > 2 * tcb->snd_mss)
 					tcb->ssthresh = tcb->snd_wnd_cur / 2;
 				else
-					tcb->ssthresh = 2 * SMSS;
+					tcb->ssthresh = 2 * tcb->snd_mss;
 
-				tcb->cwnd = SMSS;
+				tcb->cwnd = tcb->snd_mss;
 
 				gfree(segment);
 

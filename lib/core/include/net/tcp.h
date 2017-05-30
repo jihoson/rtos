@@ -50,6 +50,29 @@ typedef struct _TCP_Pseudo {
 	uint16_t        length;			///< Header and data length in bytes (endian32)
 } __attribute__((packed)) TCP_Pseudo;
 
+enum {
+	SOL_SOCKET,
+	IPPROTO_TCP
+} _SOCK_LEVEL;
+
+enum {
+	SO_BROADCAST,
+	SO_DEBUG,
+	SO_DONTLINGER,
+	SO_DONTROUTE,
+	SO_OOBINLINE,
+	SO_GROUP_PRIORITY,
+	SO_KEEPALIVE,
+	SO_LINGER,
+	SO_RCVBUF,
+	SO_REUSEADDR,
+	SO_SNDBUF
+} _SOL_SOCKET;
+
+enum {
+	TCP_NODELAY = 0x01
+} _IPPROTO_TCP;
+
 /**
  * Callbacks
  */
@@ -108,4 +131,14 @@ int32_t tcp_send(uint64_t socket, void* data, const uint16_t len);
 
 bool tcp_close(uint64_t socket);
 
+/**
+ * set socket option.
+ *
+ * @param socket TCP socket
+ * @param level network protocol layer level(SOL_SOCKET, IPPROTO_TCP)
+ * @param optname option name
+ * @param optval option value
+ * @param optlen option value's length
+ */
+int setsockopt(uint64_t socket, int level, int optname, void* optval, int optlen);
 #endif /* __NET_TCP_H__ */
