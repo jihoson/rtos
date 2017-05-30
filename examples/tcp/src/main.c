@@ -14,9 +14,9 @@
 #include <unistd.h>
 #include <readline.h>
 
-#define address 0xc0a8640b
-#define BUF_SIZE 1460
-#define SERVER_PORT 9005
+#define address 0xc0a86404
+#define BUF_SIZE 4380
+#define SERVER_PORT 10004
 
 extern uint32_t count2;
 uint64_t total_rcv;
@@ -29,7 +29,7 @@ bool flag;
 uint8_t buffer[BUF_SIZE +1];
 
 bool bps_checker(void* context) {
-	printf("%u bps, %u, %u, %u, %u, %u, %u, %u\n", total_rcv * 8, *debug_max, *debug_cur,  err[1], err[2], err[3], err[4], err[5]);
+	//printf("%u bps, %u, %u, %u, %u, %u, %u, %u\n", total_rcv * 8, *debug_max, *debug_cur,  err[1], err[2], err[3], err[4], err[5]);
 	err[2] = 0;
 	err[3] = 0;
 	err[5] = 0;
@@ -49,6 +49,28 @@ bool bps_checker(void* context) {
 int32_t my_connected(uint64_t socket, uint32_t addr, uint16_t port, void* context) {
 	printf("connected : %u, %u, %u\n", socket, addr, port);
 
+	//int val = 1;
+	//setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+
+	/*
+	int ret = 0;
+	if((ret = tcp_send(socket, buffer, BUF_SIZE)) < 0) {
+		//ret = -ret;
+		//err[ret]++;
+		printf("error %d\n", ret);
+	}
+	*/
+	int i = 0;
+	
+	for(i = 0; i < 50; i++) {
+	tcp_send(socket, "AAAAAAAAAA", 10);
+	tcp_send(socket, "BBBBBBBBBB", 10);
+	tcp_send(socket, "CCCCCCCCCC", 10);
+	}
+
+	//printf("retval:%d\n", ret);
+
+	printf("connected!!!!\n");
 	return 1;
 }
 
@@ -84,7 +106,10 @@ void ginit(int argc, char** argv) {
 		nic_ip_add(nic, address);
 	}
 
-	memset(buffer, 0xff, BUF_SIZE);
+	//memset(buffer, 0xAA, BUF_SIZE);
+	memset(buffer, 0xAA, 1460);
+	memset(buffer + 1460, 0xBB, 1460);
+	memset(buffer + 1460 + 1460, 0xCC, 1460);
 	
 	event_init();
 	total_rcv = 0;
@@ -98,7 +123,7 @@ void ginit(int argc, char** argv) {
 	tcp_init();
 	event_timer_add(bps_checker, NULL, 0, 1000000);
 	
-	uint32_t server_ip = 0xc0a86403;
+	uint32_t server_ip = 0xc0a864c8;
 	uint16_t server_port = SERVER_PORT;
 	
 	flag = false;
@@ -160,17 +185,16 @@ int main(int argc, char** argv) {
 			process(nic);
 		}
 		
-		int ret;
-		if((ret = tcp_send(socket, buffer, BUF_SIZE)) < 0) {
-			ret = -ret;
-			err[ret]++;
-		}
+		
+		//int ret;
 		/*
-		if((ret = tcp_send(socket2, buffer, BUF_SIZE)) < 0) {
-			ret = -ret;
-			err2[ret]++;
+		if((ret = tcp_send(socket, buffer, BUF_SIZE)) < 0) {
+			//ret = -ret;
+			//err[ret]++;
+			//printf("error %d\n", ret);
 		}
 		*/
+		
 		
 		event_loop();
 	}
