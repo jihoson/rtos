@@ -106,17 +106,22 @@ bool tcp_init();
 bool tcp_process(Packet* packet);
 
 /**
+ * Get new tcp socket.
+ *
+ * @return 0 if error occured, else socket number.
+ */
+uint64_t tcp_new();
+
+/**
  * Connect to remote computer, Send SYN packet.
  *
+ * @param socket socket
  * @param nic NIC that IP is added
- * @param address remote computer's IP address
- * @param port remote computer's port
- * @return 0 if error occurred, else socket number used as a tcb_key internally
+ * @param address remote computer's IP address(host endian)
+ * @param port remote computer's port(host endian)
+ * @return true if SYN msg were sent, else return false
  */
-// TODO: uint32_t return, 0 -> 0
-// ERROR; return 0, errno
-// TODO: socket's size!!
-uint64_t tcp_connect(NIC* nic, uint32_t address, uint16_t port);
+bool tcp_connect(uint64_t socket, NIC* nic, uint32_t address, uint16_t port);
 
 /**
  * Send data.
