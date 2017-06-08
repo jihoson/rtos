@@ -85,7 +85,7 @@ int main(int argc, char *argv[]) {
 
 		while(1) {
 			int rcv_size = read(client_fd, buffer, BUF_LEN);
-			printf("recv_size : %d\n", rcv_size);
+			//printf("recv_size : %d\n", rcv_size);
 			int snd_size = write(client_fd, buffer, rcv_size);
 			pthread_mutex_lock(&lock);
 			snd_data += snd_size;

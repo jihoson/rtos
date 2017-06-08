@@ -15,21 +15,22 @@
 #include <readline.h>
 
 #define address 0xc0a86404
-#define BUF_SIZE 4380
-#define SERVER_PORT 10004
+#define BUF_SIZE 1460
+#define SERVER_PORT 10000
 
 extern uint32_t count2;
 uint64_t total_rcv;
 uint64_t total_rcv2;
 uint32_t err[6];
 uint32_t err2[6];
-int64_t socket;
-int64_t socket2;
+uint64_t socket;
+uint64_t socket2;
 bool flag;
 uint8_t buffer[BUF_SIZE +1];
 
 bool bps_checker(void* context) {
-	//printf("%u bps, %u, %u, %u, %u, %u, %u, %u\n", total_rcv * 8, *debug_max, *debug_cur,  err[1], err[2], err[3], err[4], err[5]);
+//	printf("%u bps, %u, %u, %u, %u, %u, %u, %u\n", total_rcv * 8, *debug_max, *debug_cur,  err[1], err[2], err[3], err[4], err[5]);
+//	fflush(stdout);
 	err[2] = 0;
 	err[3] = 0;
 	err[5] = 0;
@@ -48,9 +49,12 @@ bool bps_checker(void* context) {
 
 int32_t my_connected(uint64_t socket, uint32_t addr, uint16_t port, void* context) {
 	printf("connected : %u, %u, %u\n", socket, addr, port);
+	fflush(stdout);
 
-	//int val = 1;
-	//setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	//while(1);
+
+	int val = 1;
+	setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
 
 	/*
 	int ret = 0;
@@ -59,14 +63,14 @@ int32_t my_connected(uint64_t socket, uint32_t addr, uint16_t port, void* contex
 		//err[ret]++;
 		printf("error %d\n", ret);
 	}
-	*/
 	int i = 0;
 	
-	for(i = 0; i < 50; i++) {
+	for(i = 0; i < 5; i++) {
 	tcp_send(socket, "AAAAAAAAAA", 10);
 	tcp_send(socket, "BBBBBBBBBB", 10);
 	tcp_send(socket, "CCCCCCCCCC", 10);
 	}
+	*/
 
 	//printf("retval:%d\n", ret);
 
@@ -106,10 +110,7 @@ void ginit(int argc, char** argv) {
 		nic_ip_add(nic, address);
 	}
 
-	//memset(buffer, 0xAA, BUF_SIZE);
-	memset(buffer, 0xAA, 1460);
-	memset(buffer + 1460, 0xBB, 1460);
-	memset(buffer + 1460 + 1460, 0xCC, 1460);
+	memset(buffer, 0xAA, BUF_SIZE);
 	
 	event_init();
 	total_rcv = 0;
@@ -120,18 +121,26 @@ void ginit(int argc, char** argv) {
 	for(int i = 0; i < 6; i++) {
 		err2[i] = 0;
 	}
+
 	tcp_init();
 	event_timer_add(bps_checker, NULL, 0, 1000000);
 	
-	uint32_t server_ip = 0xc0a864c8;
+	uint32_t server_ip = 0xc0a86403;
 	uint16_t server_port = SERVER_PORT;
 	
 	flag = false;
-	socket = tcp_connect(nic, server_ip, server_port);
-	printf("socket : %lu\n", socket);
+	socket = tcp_new();
+	if(!socket) {
+		printf("tcp_new() fail\n");
+	}
+
 	tcp_connected(socket, my_connected);
 	tcp_sent(socket, my_sent);
 	tcp_received(socket, my_received);	
+
+	if(!tcp_connect(socket, nic, server_ip, server_port)) {
+		printf("tcp_connect() fail\n");
+	}
 }
 		
 void init(int argc, char** argv) {
@@ -177,7 +186,6 @@ int main(int argc, char** argv) {
 	
 	thread_barrior();
 	
-	printf("test!!\n");
 	NIC* nic = nic_get(0);
 
 	while(1) {
@@ -186,14 +194,13 @@ int main(int argc, char** argv) {
 		}
 		
 		
-		//int ret;
-		/*
+		int ret;
+		
 		if((ret = tcp_send(socket, buffer, BUF_SIZE)) < 0) {
 			//ret = -ret;
 			//err[ret]++;
 			//printf("error %d\n", ret);
 		}
-		*/
 		
 		
 		event_loop();
