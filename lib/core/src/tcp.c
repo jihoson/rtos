@@ -28,11 +28,12 @@
 #define ECE 0x40
 #define CWR 0x80
 
-#define RECV_WND_MAX 8388480	//4000
+#define RECV_WND_MAX 10000000 //8388480	//4000
 #define ACK_TIMEOUT 2000	//2 sec
 #define MSL 10000000	//10 sec
 #define RECV_WND_SCALE 128
 #define RMSS 1460
+#define SSTHRESH 10000000
 
 extern void* __gmalloc_pool;
 
@@ -80,7 +81,7 @@ typedef struct {
 	TCP_DISCONNECTED disconnected;
 	TCP_SENT sent;
 	TCP_RECEIVED received;
-	TCP_BOUND bound;
+	TCP_ACCEPTED accepted;
 
 	List* unack_list;	// sent segment but no ack.
 	Map* rcv_buffer;
@@ -104,6 +105,9 @@ typedef struct {
 	Packet* packet;
 	uint16_t packet_data_len;
 	uint8_t sock_opt;
+
+	//for server socket
+	FIFO* backlog;
 } TCB;
 
 typedef struct {
@@ -142,7 +146,7 @@ tcp_proc_func proc_func[TCP_STATE_COUNT] = {
 };
 
 static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len);
-static Packet* tcp_packet_create(TCB* tcb);
+static Packet* tcp_packet_create(NIC* nic);
 static bool tcp_packet_out(TCB* tcb, Packet* packet, uint16_t len);
 static bool tcp_packet_prepare(TCB* tcb, Packet* packet, uint8_t flags);
 static int32_t tcp_data_add(Packet* packet, const void* data, int len);
@@ -152,6 +156,7 @@ static bool delayed_ack_timer(void* context);
 static bool tcp_try_connect(void* context); 
 static bool time_wait_timer(void* context);
 
+static uint32_t isn = 0;
 static uint32_t ip_id;
 static Map* tcbs;
 static List* time_wait_list;
@@ -227,12 +232,32 @@ static void tcp_pack(Packet* packet, uint16_t tcp_body_len) {
 	ip_pack(packet, tcp_len);
 }
 
-static uint32_t tcp_init_seqnum() {
-	//random(); find random function
-	uint64_t time;
-	uint32_t* p = (uint32_t*)&time;
+static uint32_t tcp_init_seqnum(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+	uint32_t hash;
+	uint8_t i, len = 20;
+
+	uint32_t _key[5];
+	_key[0] = sip;
+	_key[1] = dip;
+	_key[2] = (sport << 16) + dport;
+	uint32_t* p = (uint32_t*)(_key + 3);
 	asm volatile("rdtsc" : "=a"(p[0]), "=d"(p[1]));
-	return time % MAX_SEQNUM;
+	
+	uint8_t* key = (uint8_t*)_key;
+
+	for(hash = i = 0; i < len; i++) {
+		hash += key[i];
+		hash += (hash << 10);
+		hash ^= (hash >> 6);
+	}
+
+	hash += (hash << 3);
+	hash ^= (hash >> 11);
+	hash += (hash << 15);
+
+	isn += (hash % 11);
+
+	return isn + 1;
 }
 
 static void ip_init_id() {
@@ -247,10 +272,13 @@ static TCB* tcb_get(IP* ip) {
 
 	TCB* tcb = map_get(tcbs, (void*)&key);
 
-	if(!tcb) {
-		printf("map_get fail in tcb_get\n");
-		return NULL;
-	}
+	if(tcb)
+		return tcb;
+
+	key.dip = 0;
+	key.dport = 0;
+
+	tcb = map_get(tcbs, (void*)(&key));
 
 	return tcb;
 }
@@ -382,7 +410,7 @@ static TCB* tcb_create() {
 	tcb->dport = 0;
 
 	tcb->state = TCP_CLOSED;
-	tcb->sequence = tcp_init_seqnum();
+	tcb->sequence = tcp_init_seqnum(tcb->sip, tcb->dip, tcb->sport, tcb->dport);
 	tcb->acknowledgement = 0;
 
 	tcb->recv_wnd_max = RECV_WND_MAX;
@@ -390,6 +418,7 @@ static TCB* tcb_create() {
 
 	tcb->snd_wnd_max = 0;
 	tcb->snd_wnd_cur = 0;
+	tcb->snd_mss = 536;
 	tcb->snd_wnd_scale = 1;
 
 	tcb->context = NULL;
@@ -397,7 +426,7 @@ static TCB* tcb_create() {
 	tcb->disconnected = NULL;
 	tcb->sent = NULL;
 	tcb->received = NULL;
-	tcb->bound = NULL;
+	tcb->accepted = NULL;
 
 	tcb->delayed_ack_flag = false;
 	tcb->delayed_ack_timeout = 0;
@@ -572,6 +601,7 @@ int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
 	if(tcb->state != TCP_ESTABLISHED)
 		return -2;
 
+	printf("max:%u, cur:%u, cwnd:%u\n",tcb->snd_wnd_max, tcb->snd_wnd_cur, tcb->cwnd);
 	if(tcb->snd_wnd_max < tcb->cwnd)
 		avail_wnd_len = tcb->snd_wnd_max - tcb->snd_wnd_cur;
 	else
@@ -590,7 +620,7 @@ int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
 		return sent_len;
 
 	if(!tcb->packet) {
-		tcb->packet = tcp_packet_create(tcb);
+		tcb->packet = tcp_packet_create(tcb->nic);
 		if(!tcb->packet)
 			return sent_len;	//0
 		tcb->packet_data_len = 0;
@@ -631,7 +661,7 @@ int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
 		if(!nic_output_available(tcb->nic))
 			return sent_len;
 
-		tcb->packet = tcp_packet_create(tcb);
+		tcb->packet = tcp_packet_create(tcb->nic);
 		if(!tcb->packet)
 			return sent_len;
 
@@ -664,7 +694,7 @@ int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
 	if(!nic_output_available(tcb->nic))
 		return sent_len;
 
-	tcb->packet = tcp_packet_create(tcb);
+	tcb->packet = tcp_packet_create(tcb->nic);
 	if(!tcb->packet)
 		return sent_len;
 
@@ -690,6 +720,65 @@ int32_t tcp_send(uint64_t socket, void* data, uint16_t len) {
 	tcb->delayed_ack_flag = false;
 
 	return sent_len;
+}
+
+bool tcp_bind(uint64_t socket, NIC* nic, uint32_t src_addr, uint16_t src_port) {
+	if(!socket) {
+		printf("invalid socket\n");
+		return false;
+	}
+
+	TCB* tcb = (TCB*)socket;
+
+	if(!tcp_port_alloc0(nic, src_addr, src_port)) {
+		printf("port_alloc fail\n");
+		return false;
+	}
+
+	tcb->nic = nic;
+	tcb->sip = endian32(src_addr);
+	tcb->sport = endian16(src_port);
+	tcb->dip = 0;
+	tcb->dport = 0;
+
+	return true;
+}
+
+bool tcp_listen(uint64_t socket, uint16_t backlog) {
+	if(!socket) {
+		printf("invalid socket\n");
+		return false;
+	}
+
+	TCB* tcb = (TCB*)socket;
+	tcb->backlog = fifo_create(backlog, NULL);
+	if(!tcb->backlog) {
+		printf("create backlog fail\n");
+		return false;
+	}
+
+	Session* key = (Session*)gmalloc(sizeof(Session));
+	if(!key) {
+		printf("key create in listen fail\n");
+		fifo_destroy(tcb->backlog);
+		return false;
+	}
+
+	key->sip = tcb->sip;
+	key->dip = tcb->dip;
+	key->sport = tcb->sport;
+	key->dport = tcb->dport;
+
+	if(!map_put(tcbs, (void*)key, (void*)(uintptr_t)tcb)) {
+		printf("map_put fail\n");
+		fifo_destroy(tcb->backlog);
+		gfree(key);
+		return false;
+	}
+
+	tcb->state = TCP_LISTEN;
+
+	return true;
 }
 
 bool tcp_process(Packet* packet) {
@@ -718,9 +807,7 @@ bool tcp_process(Packet* packet) {
 }
 
 //create packet with no data, only fills immutable header
-static Packet* tcp_packet_create(TCB* tcb) {
-	NIC* nic = tcb->nic;
-
+static Packet* tcp_packet_create(NIC* nic) {
 	Packet* packet = nic_alloc(nic, sizeof(Ether) + sizeof(IP) + sizeof(TCP) + RMSS);
 
 	if(!packet)
@@ -729,7 +816,6 @@ static Packet* tcp_packet_create(TCB* tcb) {
 	//packet->end -= RMSS;
 
 	Ether* ether = (Ether*)(packet->buffer + packet->start);
-	ether->dmac = endian48(tcb->dmac);
 	ether->smac = endian48(nic->mac);
 	ether->type = endian16(ETHER_TYPE_IPv4);
 
@@ -745,12 +831,8 @@ static Packet* tcp_packet_create(TCB* tcb) {
 	ip->flags_offset = 0x40;
 	ip->ttl = endian8(IPDEFTTL);
 	ip->protocol = endian8(IP_PROTOCOL_TCP);
-	ip->source = tcb->sip;
-	ip->destination = tcb->dip;
 	
 	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
-	tcp->source = tcb->sport;
-	tcp->destination = tcb->dport;
 	tcp->ns = endian8(0);
 	tcp->reserved = endian8(0);
 	tcp->offset = endian8(5);
@@ -773,17 +855,24 @@ static int32_t tcp_data_add(Packet* packet, const void* data, int len) {
 	return len;
 }
 
+//maybe don't need return value. could be always true.
 static bool tcp_packet_prepare(TCB* tcb, Packet* packet, uint8_t flags) {
 	if(!packet)
 		return false;
 	
 	Ether* ether = (Ether*)(packet->buffer + packet->start);
-	IP* ip = (IP*)ether->payload;
-	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
+	ether->dmac = tcb->dmac;
 
+	IP* ip = (IP*)ether->payload;
+	ip->source = tcb->sip;
+	ip->destination = tcb->dip;
+
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
 	tcp->sequence = endian32(tcb->sequence);
 	tcp->acknowledgement = endian32(tcb->acknowledgement);
 	tcp->fin = flags & FIN; 
+	tcp->source = tcb->sport;
+	tcp->destination = tcb->dport;
 	tcp->syn = (flags & SYN) >> 1;
 	tcp->rst = (flags & SYN) >> 2;
 	tcp->psh = (flags & PSH) >> 3;
@@ -866,7 +955,7 @@ static Packet* packet_create(TCB* tcb, uint8_t flags, const void* data, int len)
 		return NULL;
 
 	Ether* ether = (Ether*)(packet->buffer + packet->start);
-	ether->dmac = endian48(tcb->dmac);
+	ether->dmac = tcb->dmac;
 	ether->smac = endian48(nic->mac);
 	ether->type = endian16(ETHER_TYPE_IPv4);
 	
@@ -970,17 +1059,6 @@ bool tcp_connected(uint64_t socket, TCP_CONNECTED connected) {
 	return true;
 }
 
-bool tcp_bound(uint64_t socket, TCP_BOUND bound) {
-	if(!socket)
-		return false;
-
-	TCB* tcb = (TCB*)socket;
-
-	tcb->bound = bound;
-
-	return true;
-}
-
 bool tcp_disconnected(uint64_t socket, TCP_DISCONNECTED disconnected) {
 	if(!socket)
 		return false;
@@ -1010,6 +1088,17 @@ bool tcp_received(uint64_t socket, TCP_RECEIVED received) {
 	TCB* tcb = (TCB*)socket;
 
 	tcb->received = received;
+
+	return true;
+}
+
+bool tcp_accepted(uint64_t socket, TCP_ACCEPTED accepted) {
+	if(!socket)
+		return false;
+
+	TCB* tcb = (TCB*)socket;
+
+	tcb->accepted = accepted;
 
 	return true;
 }
@@ -1077,6 +1166,8 @@ static bool unacked_segment_timer(void* context) {
 }
 
 static bool delayed_ack_timer(void* context) {
+	isn += 400000;
+
 	uint64_t current = timer_ms();
 
 	if(!tcbs)
@@ -1116,7 +1207,7 @@ static bool tcp_try_connect(void* context) {
 	}
 
 	if(mac != 0xffffffffffff) {
-		tcb->dmac = mac;
+		tcb->dmac = endian48(mac);
 
 		if(!nic_output_available(tcb->nic))
 			return true;
@@ -1159,11 +1250,6 @@ static bool process_syn_sent(TCB* tcb, Packet* in_packet) {
 
 	//printf("proc syn_sent\n");
 	if(tcp->syn == 1 && tcp->ack == 1) {
-		tcb->acknowledgement = endian32(tcp->sequence) + 1;
-		tcb->last_ack = endian32(tcp->ack);
-
-		tcb->snd_wnd_max = endian16(tcp->window);
-		tcb->snd_wnd_cur = 0;
 
 		if(tcp->offset > 5) {
 			uint8_t* option = (uint8_t*)tcp->payload;
@@ -1196,6 +1282,11 @@ static bool process_syn_sent(TCB* tcb, Packet* in_packet) {
 				}
 			}
 		}
+		tcb->acknowledgement = endian32(tcp->sequence) + 1;
+		tcb->last_ack = endian32(tcp->ack);
+
+		tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
+		tcb->snd_wnd_cur = 0;
 
 		Packet* tmp_packet = packet_create(tcb, ACK, NULL, 0);
 		if(!tmp_packet) {
@@ -1214,7 +1305,7 @@ static bool process_syn_sent(TCB* tcb, Packet* in_packet) {
 		else if(0 < tcb->snd_mss && tcb->snd_mss <= 1095)
 			tcb->cwnd = 4 * tcb->snd_mss;
 
-		tcb->ssthresh = 10000000;//65535;
+		tcb->ssthresh = SSTHRESH;
 		tcb->state = TCP_ESTABLISHED;
 		tcb->connected((uint64_t)tcb, endian32(tcb->dip), endian16(tcb->dport), tcb->context);
 
@@ -1227,7 +1318,18 @@ static bool process_syn_sent(TCB* tcb, Packet* in_packet) {
 }
 
 static bool process_syn_rcvd(TCB* tcb, Packet* in_packet) {
-	printf("syn_rcvd\n");
+	Ether* ether = (Ether*)(in_packet->buffer + in_packet->start);
+	IP* ip = (IP*)ether->payload;
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
+
+	if(tcp->ack) {
+		tcb->state = TCP_ESTABLISHED;
+		if(tcb->accepted)
+			tcb->accepted((uint64_t)tcb, tcb->context);
+
+	} else if(tcp->rst) {
+		//TODO:transition to listen state
+	}
 
 	return true;
 }
@@ -1327,8 +1429,9 @@ static bool process_established(TCB* tcb, Packet* in_packet) {
 			// buffering out of order packet.
 			Packet* tmp_packet = packet_create(tcb, ACK, NULL, 0);
 
-			if(!packet_out(tcb, tmp_packet, 0))
+			if(!packet_out(tcb, tmp_packet, 0)) {
 				printf("send dup ack fail\n");
+			}
 
 			IP* tmp = gmalloc(endian16(ip->length));
 			if(!tmp)
@@ -1337,8 +1440,9 @@ static bool process_established(TCB* tcb, Packet* in_packet) {
 			memcpy(tmp, ip, endian16(ip->length));
 
 			// TODO:need to limit the out-of-order map size
-			if(!map_put(tcb->rcv_buffer, (void*)(uintptr_t)endian32(tcp->sequence), tmp))
+			if(!map_put(tcb->rcv_buffer, (void*)(uintptr_t)endian32(tcp->sequence), tmp)) {
 				printf("put out-of-order fail\n");
+			}
 		}
 	} else {
 		//TODO: no logic decided
@@ -1347,9 +1451,120 @@ static bool process_established(TCB* tcb, Packet* in_packet) {
 	return true;
 }
 
-static bool process_listen(TCB* tcb, Packet* in_packet) {
-	printf("process_listen\n");
+static bool process_listen(TCB* arg_tcb, Packet* in_packet) {
+	Ether* ether = (Ether*)(in_packet->buffer + in_packet->start);
+	IP* ip = (IP*)ether->payload;
+	TCP* tcp = (TCP*)((uint8_t*)ip->body + (ip->ihl - 5) * 4);
 
+	if(!tcp->syn)
+		return false;
+
+	//TODO: need to guarantee(as far as possible) to be sent about control packet.
+	if(!nic_output_available(in_packet->nic))
+		return false;
+
+	TCB* tcb = tcb_create();
+	if(!tcb)
+		return false;
+
+	Packet* packet = tcp_packet_create(in_packet->nic);
+	if(!packet) {
+		tcb_destroy(tcb);
+	}
+
+	tcb->sip = arg_tcb->sip;
+	tcb->sport = arg_tcb->sport;
+	
+	tcb->dmac = ether->smac;
+	tcb->dip = ip->source;
+	tcb->dport = tcp->source;
+
+	tcb->sequence = tcp_init_seqnum(tcb->sip, tcb->dip, tcb->sport, tcb->dport);
+	tcb->acknowledgement = endian32(tcp->sequence) + 1;
+	tcb->state = TCP_SYN_RCVD;
+
+	tcb->context = arg_tcb->context;
+	tcb->connected = arg_tcb->connected;
+	tcb->disconnected = arg_tcb->disconnected;
+	tcb->sent = arg_tcb->sent;
+	tcb->received = arg_tcb->received;
+	tcb->accepted = arg_tcb->accepted;
+	
+	tcb->recv_wnd_max = arg_tcb->recv_wnd_max;
+	tcb->last_ack = endian32(tcp->acknowledgement);
+	tcb->recv_wnd_scale = arg_tcb->recv_wnd_scale;
+	tcb->nic = arg_tcb->nic;
+
+	tcb->delayed_ack_flag = false;
+	tcb->delayed_ack_timeout = 0;
+	tcb->syn_counter = 0;
+
+	if(tcp->offset > 5) {
+		uint8_t* option = (uint8_t*)tcp->payload;
+		uint8_t* data = (uint8_t*)((uint32_t*)tcp + tcp->offset);
+
+		while(option < data) {
+			switch(*option) {
+				case 0:
+					option++;
+					break;
+				case 1:
+					option++;
+					break;
+				case 2:
+					option += 2;
+					tcb->snd_mss = endian16(*(uint16_t*)option);
+					option += 2;
+
+					if(tcb->snd_mss > 1460)	// cause our driver doesn't support TSO.
+						tcb->snd_mss = 1460;
+					break;
+				case 3:
+					option += 2;
+					tcb->snd_wnd_scale = 1 << *option;
+					option++;
+					break;
+				default:
+					option += *(option + 1);
+					break;
+			}
+		}
+	}
+
+	tcb->snd_wnd_max = endian16(tcp->window) * tcb->snd_wnd_scale;
+	tcb->snd_wnd_cur = 0;
+
+	if(tcb->snd_mss > 2190)
+		tcb->cwnd = 2 * tcb->snd_mss;
+	else if(1095 < tcb->snd_mss && tcb->snd_mss <= 2190)
+		tcb->cwnd = 3 * tcb->snd_mss;
+	else if(0 < tcb->snd_mss && tcb->snd_mss <= 1095)
+		tcb->cwnd = 4 * tcb->snd_mss;
+
+	tcb->ssthresh = SSTHRESH;
+
+	Session* key = (Session*)gmalloc(sizeof(Session));
+	key->sip = tcb->sip;
+	key->dip = tcb->dip;
+	key->sport = tcb->sport;
+	key->dport = tcb->dport;
+
+	if(!map_put(tcbs, (void*)key, (void*)(uintptr_t)tcb)) {
+		gfree(key);
+		tcb_destroy(tcb);
+		nic_free(packet);
+	}
+
+	if(!tcp_packet_prepare(tcb, packet, SYN | ACK)) {
+		tcb_destroy(tcb);
+		nic_free(packet);
+	}
+
+	if(!tcp_packet_out(tcb, packet, 0))
+		return false;
+
+	tcb->sequence += 1;
+	tcb->state = TCP_SYN_RCVD;
 	return true;
 }
 
@@ -1360,6 +1575,7 @@ static bool process_fin_wait_1(TCB* tcb, Packet* in_packet) {
 
 	if(tcp->fin && tcp->ack) {
 		// TODO: simultaneous close
+		 
 	} else if(tcp->ack) {
 		uint32_t tmp_ack = endian32(tcp->acknowledgement);
 
