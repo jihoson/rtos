@@ -77,18 +77,23 @@ enum {
  * Callbacks
  */
 typedef int32_t (*TCP_CONNECTED)(uint64_t socket, uint32_t addr, uint16_t port, void* context);
-typedef int32_t (*TCP_BOUND)(uint64_t socket, uint32_t addr, uint16_t port, void* context);
+/**
+ * Once tcp_accepted callback is called. User has responsibility managing socket.
+ * If user doesn't want to user socket, then should close socker using close().
+ */
+typedef int32_t (*TCP_ACCEPTED)(uint64_t new_socket, void* context);
 typedef int32_t (*TCP_DISCONNECTED)(uint64_t socket, void* context);
 typedef int32_t (*TCP_SENT)(uint64_t socket, size_t len, void* context);
 typedef int32_t (*TCP_RECEIVED)(uint64_t socket, void* buf, size_t len, void* context);
 
 // TODO: socket ID -> uint32_t
 bool tcp_connected(uint64_t socket, TCP_CONNECTED connected);
-bool tcp_bound(uint64_t socket, TCP_BOUND bound);
+bool tcp_accepted(uint64_t socket, TCP_ACCEPTED accepted);
 bool tcp_disconnected(uint64_t socket, TCP_DISCONNECTED disconnected);
 bool tcp_sent(uint64_t socket, TCP_SENT sent);
 bool tcp_received(uint64_t socket, TCP_RECEIVED received);
 bool tcp_context(uint64_t socket, void* context);
+bool tcp_accepted(uint64_t socket, TCP_ACCEPTED accepted);
 
 /**
   * Init valuse about tcp.
@@ -135,6 +140,10 @@ bool tcp_connect(uint64_t socket, NIC* nic, uint32_t address, uint16_t port);
 int32_t tcp_send(uint64_t socket, void* data, const uint16_t len);
 
 bool tcp_close(uint64_t socket);
+
+bool tcp_bind(uint64_t socket, NIC* nic, uint32_t ip, uint16_t port);
+
+bool tcp_listen(uint64_t socket, uint16_t backlog);
 
 /**
  * set socket option.

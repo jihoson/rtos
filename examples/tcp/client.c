@@ -67,23 +67,25 @@ int main(int argc, char *argv[]) {
 		perror("create thread1 error\n");
 		return -1;
 	}
-/**
+
 	if(pthread_create(&thread2, NULL, &receiver, NULL) < 0) {
 		perror("create thread2 error\n");
 		return -1;
 	}
-**/
-	memset(buffer, 0xaa, BUF_LEN);
 
+	memset(buffer, 0xaa, BUF_LEN);
+while(1);
 	while(1) {
 		//usleep(1000);
 		write(sock, buffer, BUF_LEN);
 	//	send(sock, buffer, BUF_LEN, 0);
 		
+		/*
 		int read_size = read(sock, buffer, BUF_LEN);
 		pthread_mutex_lock(&lock);
 		total += read_size;
 		pthread_mutex_unlock(&lock);
+		*/
 	}
 	close(sock);
 	return 0;
